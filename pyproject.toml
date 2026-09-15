@@ -1,0 +1,42 @@
+[project]
+name = "geri"
+version = "0.1.0"
+description = "Geri, Odin's ravenous wolf: tears down GitLab groups and projects (schedules them for deletion)"
+readme = "README.md"
+authors = [
+    { name = "Richard Zowalla", email = "rzo1@apache.org" }
+]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = [
+    "pydantic-settings>=2.15.0",
+    "python-gitlab>=8.5.0",
+    "requests>=2.32.0",
+    "rich>=15.0.0",
+    "typer>=0.27.1",
+]
+
+[project.scripts]
+geri = "geri.cli:app"
+dms = "geri.cli:app"  # "delete my shit"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
