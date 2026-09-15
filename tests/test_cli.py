@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from geri import cli
 from geri.deleter import DeletionResult
-from geri.models import GroupNode, ProjectNode, UserNamespaceNode
+from geri.models import GroupNode, ProjectNode, RegistryRepository, UserNamespaceNode
 
 runner = CliRunner()
 
@@ -52,6 +52,8 @@ def sample_namespace() -> UserNamespaceNode:
 
 
 class FakeDiscovery:
+    registries: dict = {}
+    registry_error: Exception | None = None
     namespace: UserNamespaceNode | None = None
     tree: GroupNode | None = None
     project: ProjectNode | None = None
@@ -66,6 +68,12 @@ class FakeDiscovery:
         if self.error is not None:
             raise self.error
         return self.tree
+
+    def get_registries(self, projects):
+        FakeDiscovery.calls.append(("registries", [p.id for p in projects]))
+        if self.registry_error is not None:
+            raise self.registry_error
+        return {p.id: self.registries[p.id] for p in projects if p.id in self.registries}
 
     def get_user_namespace(self):
         FakeDiscovery.calls.append(("user",))
@@ -83,7 +91,9 @@ class FakeDiscovery:
 class FakeDeleter:
     status: str = "scheduled"
     failing: set[int] = set()
+    messages: dict[int, str] = {}
     calls: list[tuple] = []
+    registries: list = []
 
     def __init__(self, gl) -> None:
         self.gl = gl
@@ -96,16 +106,19 @@ class FakeDeleter:
             node.full_path,
             status,  # type: ignore[arg-type]
             deletion_date="2026-09-22" if status == "scheduled" else None,
-            message="403 Forbidden" if status == "failed" else "",
+            message=self.messages.get(node.id, "403 Forbidden") if status == "failed" else "",
         )
 
-    def delete_projects(self, projects):
+    def delete_projects(self, projects, registries=None):
+        FakeDeleter.registries.append(registries)
         return [self._result("project", p) for p in projects]
 
-    def delete_group(self, group):
+    def delete_group(self, group, registries=None):
+        FakeDeleter.registries.append(registries)
         return self._result("group", group)
 
-    def delete_project(self, project):
+    def delete_project(self, project, registries=None):
+        FakeDeleter.registries.append(registries)
         return self._result("project", project)
 
 
@@ -128,9 +141,13 @@ def patched(monkeypatch, tmp_path):
     FakeDiscovery.project = ProjectNode(id=5, full_path="top/solo", name="solo")
     FakeDiscovery.error = None
     FakeDiscovery.calls = []
+    FakeDiscovery.registries = {}
+    FakeDiscovery.registry_error = None
     FakeDeleter.status = "scheduled"
     FakeDeleter.calls = []
     FakeDeleter.failing = set()
+    FakeDeleter.messages = {}
+    FakeDeleter.registries = []
     monkeypatch.setattr(cli, "get_client", fake_get_client)
     monkeypatch.setattr(cli, "TreeDiscovery", FakeDiscovery)
     monkeypatch.setattr(cli, "Deleter", FakeDeleter)
@@ -348,3 +365,81 @@ def test_group_no_subgroups_skips_already_scheduled_projects():
     assert result.exit_code == cli.EXIT_FAILED, result.output
     assert FakeDeleter.calls == [("project", 10)]
     assert "1 skipped (already scheduled)" in result.output
+
+
+# --------------------------------------------------------------------------- --purge-registry
+
+REGISTRY_ERROR = "400: Cannot rename or delete project because it contains container registry tags."
+
+
+def test_registries_are_not_queried_without_flag():
+    result = runner.invoke(cli.app, ["group", "top"], input="top\n")
+    assert result.exit_code == 0, result.output
+    assert not any(call[0] == "registries" for call in FakeDiscovery.calls)
+    assert FakeDeleter.registries == [{}]
+
+
+def test_group_purge_registry_lists_and_passes_registries():
+    repo = RegistryRepository(id=7, path="top/sub/deep-repo/app", tags_count=3)
+    FakeDiscovery.registries = {11: [repo]}
+    result = runner.invoke(cli.app, ["group", "top", "--purge-registry"], input="top\n")
+    assert result.exit_code == 0, result.output
+    assert ("registries", [10, 11]) in FakeDiscovery.calls  # every project in the group
+    assert "top/sub/deep-repo/app" in result.output and "3 tag(s)" in result.output
+    assert "purged permanently" in result.output
+    assert "1 container registry repository(ies) with 3 tag(s) in 1 project(s)" in result.output
+    assert "never restorable" in result.output
+    assert FakeDeleter.registries == [{11: [repo]}]
+
+
+def test_user_purge_registry_only_checks_pending_projects():
+    result = runner.invoke(cli.app, ["user", "--purge-registry", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert ("registries", [20, 22]) in FakeDiscovery.calls  # 21 is already scheduled
+    assert "No container registry images to purge." in result.output
+    assert FakeDeleter.calls == []
+
+
+def test_no_subgroups_purge_registry_only_checks_direct_projects():
+    result = runner.invoke(
+        cli.app, ["group", "top", "--no-subgroups", "--purge-registry"], input="top\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert ("registries", [10]) in FakeDiscovery.calls
+    assert FakeDeleter.registries == [{}]
+
+
+def test_project_purge_registry():
+    repo = RegistryRepository(id=1, path="top/solo", tags_count=None)
+    FakeDiscovery.registries = {5: [repo]}
+    result = runner.invoke(cli.app, ["project", "top/solo", "--purge-registry"], input="top/solo\n")
+    assert result.exit_code == 0, result.output
+    assert "? tags" in result.output
+    assert FakeDeleter.registries == [{5: [repo]}]
+
+
+def test_registry_listing_error_aborts_before_prompt():
+    from gitlab.exceptions import GitlabListError
+
+    FakeDiscovery.registry_error = GitlabListError("500 Internal Server Error", response_code=500)
+    result = runner.invoke(cli.app, ["group", "top", "--purge-registry"], input="top\n")
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "listing container registries failed" in result.output
+    assert FakeDeleter.calls == []
+
+
+def test_registry_error_without_flag_suggests_purge():
+    FakeDeleter.status = "failed"
+    FakeDeleter.messages = {5: REGISTRY_ERROR}
+    result = runner.invoke(cli.app, ["project", "top/solo"], input="top/solo\n")
+    assert result.exit_code == cli.EXIT_FAILED
+    assert "--purge-registry" in result.output
+
+
+def test_registry_error_in_summary_suggests_purge():
+    FakeDeleter.failing = {20}
+    FakeDeleter.messages = {20: REGISTRY_ERROR}
+    result = runner.invoke(cli.app, ["user"], input="alice\n")
+    assert result.exit_code == cli.EXIT_FAILED
+    flat = "".join(result.output.replace("│", "").split())  # table cells wrap
+    assert "re-runwith--purge-registry" in flat

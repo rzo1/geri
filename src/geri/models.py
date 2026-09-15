@@ -99,3 +99,25 @@ class UserNamespaceNode:
     @property
     def full_path(self) -> str:
         return self.username
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryRepository:
+    """A container registry repository of a project."""
+
+    id: int
+    path: str
+    tags_count: int | None = None
+
+    @classmethod
+    def from_gl(cls, repository: Any) -> RegistryRepository:
+        tags_count = getattr(repository, "tags_count", None)
+        return cls(
+            id=int(repository.id),
+            path=str(getattr(repository, "path", None) or repository.id),
+            tags_count=int(tags_count) if tags_count is not None else None,
+        )
+
+
+Registries = dict[int, list[RegistryRepository]]
+"""Container registry repositories keyed by project id (only projects that have any)."""

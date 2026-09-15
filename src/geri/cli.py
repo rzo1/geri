@@ -22,7 +22,7 @@ from geri import __version__
 from geri.config import Settings, get_client
 from geri.deleter import Deleter, DeletionResult
 from geri.discovery import TreeDiscovery
-from geri.models import GroupNode, ProjectNode, UserNamespaceNode
+from geri.models import GroupNode, ProjectNode, Registries, UserNamespaceNode
 
 EXIT_OK = 0
 EXIT_FAILED = 1  # a deletion request failed
@@ -83,6 +83,16 @@ NoSubgroupsOpt = Annotated[
         ),
     ),
 ]
+PurgeRegistryOpt = Annotated[
+    bool,
+    typer.Option(
+        "--purge-registry",
+        help=(
+            "Delete the container registry images of the projects first (GitLab refuses to "
+            "delete projects that have any). Permanent: images are not restorable."
+        ),
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,7 @@ class CommonOptions:
     token: str | None = None
     dry_run: bool = False
     no_subgroups: bool = False
+    purge_registry: bool = False
 
     def to_settings(self) -> Settings:
         """Build ``Settings`` from env/.env, overridden by the given CLI values."""
@@ -164,38 +175,79 @@ def _kept_label(group: GroupNode) -> str:
     return f"{_group_label(group)} [green]kept ({inside} inside)[/green]"
 
 
+def _tags(count: int | None) -> str:
+    return "? tags" if count is None else f"{count} tag(s)"
+
+
+def _add_registries(branch: Tree, project: ProjectNode, registries: Registries) -> None:
+    for repo in registries.get(project.id, []):
+        branch.add(
+            f"[magenta]registry[/magenta] {escape(repo.path)} [dim]({_tags(repo.tags_count)})"
+            "[/dim] [red]purged permanently[/red]"
+        )
+
+
 Target = GroupNode | ProjectNode | UserNamespaceNode
 
 
-def build_tree(target: Target, keep_subgroups: bool = False) -> Tree:
+def build_tree(
+    target: Target, keep_subgroups: bool = False, registries: Registries | None = None
+) -> Tree:
     """Rich tree of ``target``: subgroups first, then projects, both sorted by path.
 
     With ``keep_subgroups`` the subgroups of a group are shown collapsed and marked
-    as kept instead of being expanded.
+    as kept instead of being expanded. Container ``registries`` to purge are shown
+    below their project.
     """
+    registries = registries or {}
+
+    def add_project(branch: Tree, project: ProjectNode) -> None:
+        _add_registries(branch.add(_project_label(project)), project, registries)
+
     if isinstance(target, ProjectNode):
-        return Tree(_project_label(target))
+        tree = Tree(_project_label(target))
+        _add_registries(tree, target, registries)
+        return tree
     if isinstance(target, UserNamespaceNode):
         tree = Tree(_user_label(target))
         for project in target.projects:
-            tree.add(_project_label(project))
+            add_project(tree, project)
         return tree
 
     def add(branch: Tree, group: GroupNode) -> None:
         for sub in group.subgroups:
             add(branch.add(_group_label(sub)), sub)
         for project in group.projects:
-            branch.add(_project_label(project))
+            add_project(branch, project)
 
     tree = Tree(_group_label(target))
     if keep_subgroups:
         for sub in target.subgroups:
             tree.add(_kept_label(sub))
         for project in target.projects:
-            tree.add(_project_label(project))
+            add_project(tree, project)
         return tree
     add(tree, target)
     return tree
+
+
+def _describe_registries(registries: Registries) -> str:
+    repos = [repo for repo_list in registries.values() for repo in repo_list]
+    tags = sum(repo.tags_count or 0 for repo in repos)
+    return (
+        f"{len(repos)} container registry repository(ies) with {tags} tag(s) in "
+        f"{len(registries)} project(s)"
+    )
+
+
+_REGISTRY_ERROR_MARKER = "container registry"
+
+
+def _with_hint(message: str, purge_registry: bool) -> str:
+    """Point at --purge-registry when GitLab refused because of registry tags."""
+    if not purge_registry and _REGISTRY_ERROR_MARKER in message.lower():
+        return f"{message} (re-run with --purge-registry to delete the images first)"
+    return message
 
 
 def _describe_projects(projects: list[ProjectNode], extra_scheduled: int = 0) -> str:
@@ -220,7 +272,13 @@ def _describe_contents(target: GroupNode | UserNamespaceNode) -> str:
     )
 
 
-def _confirm(kind: str, target: Target, pending: list[ProjectNode], keep_subgroups: bool) -> bool:
+def _confirm(
+    kind: str,
+    target: Target,
+    pending: list[ProjectNode],
+    keep_subgroups: bool,
+    registries: Registries,
+) -> bool:
     """Ask the user to type the target's full path; return whether it matched."""
     if isinstance(target, UserNamespaceNode):
         what = (
@@ -240,8 +298,14 @@ def _confirm(kind: str, target: Target, pending: list[ProjectNode], keep_subgrou
         if isinstance(target, GroupNode):
             what += f" including all {_describe_contents(target)} listed above"
         what += " for deletion"
+    purge = ""
+    if registries:
+        purge = (
+            f"\n[bold red]First, {_describe_registries(registries)} are deleted "
+            "permanently; container images are never restorable.[/bold red]"
+        )
     console.print(
-        f"\n[bold red]WARNING:[/bold red] this schedules {what}.\n"
+        f"\n[bold red]WARNING:[/bold red] this schedules {what}.{purge}\n"
         "GitLab keeps deleted items restorable until the deletion date if delayed deletion "
         "applies; [bold]otherwise they are removed immediately and cannot be "
         "undone[/bold].",
@@ -258,7 +322,7 @@ def _confirm(kind: str, target: Target, pending: list[ProjectNode], keep_subgrou
     return answer.strip() == target.full_path
 
 
-def _print_result(result: DeletionResult) -> None:
+def _print_result(result: DeletionResult, purge_registry: bool = False) -> None:
     name = f"{result.kind} [bold]{escape(result.full_path)}[/bold]"
     if result.status == "scheduled":
         console.print(
@@ -268,13 +332,14 @@ def _print_result(result: DeletionResult) -> None:
     elif result.status == "deleting":
         console.print(f"[cyan]Deletion accepted[/cyan] for {name}: {escape(result.message)}.")
     else:
-        console.print(f"[bold red]Failed[/bold red] to delete {name}: {escape(result.message)}")
+        message = _with_hint(result.message, purge_registry)
+        console.print(f"[bold red]Failed[/bold red] to delete {name}: {escape(message)}")
 
 
 _STATUS_STYLE = {"scheduled": "green", "deleting": "cyan", "failed": "bold red"}
 
 
-def _summary_table(results: list[DeletionResult]) -> Table:
+def _summary_table(results: list[DeletionResult], purge_registry: bool = False) -> Table:
     table = Table(title="Summary")
     table.add_column("Project", overflow="fold")
     table.add_column("Status")
@@ -284,7 +349,7 @@ def _summary_table(results: list[DeletionResult]) -> Table:
         table.add_row(
             escape(r.full_path),
             f"[{style}]{r.status}[/{style}]",
-            escape(r.deletion_date or r.message),
+            escape(r.deletion_date or _with_hint(r.message, purge_registry)),
         )
     return table
 
@@ -354,7 +419,28 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
         _fail(f"listing {label} failed: {exc}")
 
     keep_subgroups = opts.no_subgroups and isinstance(target, GroupNode)
-    console.print(build_tree(target, keep_subgroups=keep_subgroups))
+    # Project-by-project mode: personal namespaces, and groups whose subgroups are kept.
+    bulk = keep_subgroups or isinstance(target, UserNamespaceNode)
+    pending: list[ProjectNode] = (
+        [p for p in target.projects if not p.marked_for_deletion_on] if bulk else []
+    )
+
+    registries: Registries = {}
+    if opts.purge_registry:
+        if bulk:
+            affected = pending
+        elif isinstance(target, GroupNode):
+            affected = [] if target.marked_for_deletion_on else target.walk_projects()
+        else:
+            affected = [] if target.marked_for_deletion_on else [target]
+        if affected:
+            console.print(f"Checking container registries of {len(affected)} project(s)...")
+        try:
+            registries = TreeDiscovery(client).get_registries(affected)
+        except (GitlabError, RequestException) as exc:
+            _fail(f"listing container registries failed: {exc}")
+
+    console.print(build_tree(target, keep_subgroups=keep_subgroups, registries=registries))
     if keep_subgroups:
         console.print(
             f"Group contains {_describe_projects(target.projects)} directly; its "
@@ -364,12 +450,13 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
         console.print(f"Group contains {_describe_contents(target)}.")
     elif isinstance(target, UserNamespaceNode):
         console.print(f"Personal namespace contains {_describe_contents(target)}.")
+    if opts.purge_registry:
+        if registries:
+            console.print(f"[red]To purge: {_describe_registries(registries)}.[/red]")
+        else:
+            console.print("No container registry images to purge.")
 
-    # Project-by-project mode: personal namespaces, and groups whose subgroups are kept.
-    bulk = keep_subgroups or isinstance(target, UserNamespaceNode)
-    pending: list[ProjectNode] = []
     if bulk:
-        pending = [p for p in target.projects if not p.marked_for_deletion_on]
         if not pending:
             console.print("[yellow]No projects left to delete; nothing to do.[/yellow]")
             raise typer.Exit(EXIT_OK)
@@ -384,24 +471,24 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
         console.print("[yellow]Dry run:[/yellow] nothing will be deleted.")
         raise typer.Exit(EXIT_OK)
 
-    if not _confirm(kind, target, pending, keep_subgroups):
+    if not _confirm(kind, target, pending, keep_subgroups, registries):
         console.print("[yellow]Confirmation did not match. Nothing was deleted.[/yellow]")
         raise typer.Exit(EXIT_ABORTED)
 
     deleter = Deleter(client)
     if bulk:
-        results = deleter.delete_projects(pending)
-        console.print(_summary_table(results))
+        results = deleter.delete_projects(pending, registries)
+        console.print(_summary_table(results, opts.purge_registry))
         if _print_counts(results, skipped=len(target.projects) - len(pending)):
             raise typer.Exit(EXIT_FAILED)
         return
 
     if isinstance(target, GroupNode):
-        result = deleter.delete_group(target)
+        result = deleter.delete_group(target, registries)
     else:
-        result = deleter.delete_project(target)
+        result = deleter.delete_project(target, registries)
 
-    _print_result(result)
+    _print_result(result, opts.purge_registry)
     if result.status == "failed":
         raise typer.Exit(EXIT_FAILED)
 
@@ -439,6 +526,7 @@ def group(
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
     no_subgroups: NoSubgroupsOpt = False,
+    purge_registry: PurgeRegistryOpt = False,
 ) -> None:
     """List a group with all subgroups and projects, then schedule it for deletion.
 
@@ -448,7 +536,13 @@ def group(
     _execute(
         "group",
         group_id_or_path,
-        CommonOptions(url=url, token=token, dry_run=dry_run, no_subgroups=no_subgroups),
+        CommonOptions(
+            url=url,
+            token=token,
+            dry_run=dry_run,
+            no_subgroups=no_subgroups,
+            purge_registry=purge_registry,
+        ),
     )
 
 
@@ -460,9 +554,14 @@ def project(
     url: UrlOpt = None,
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
+    purge_registry: PurgeRegistryOpt = False,
 ) -> None:
     """Show a project, then schedule it for deletion."""
-    _execute("project", project_id_or_path, CommonOptions(url=url, token=token, dry_run=dry_run))
+    _execute(
+        "project",
+        project_id_or_path,
+        CommonOptions(url=url, token=token, dry_run=dry_run, purge_registry=purge_registry),
+    )
 
 
 @app.command()
@@ -470,13 +569,18 @@ def user(
     url: UrlOpt = None,
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
+    purge_registry: PurgeRegistryOpt = False,
 ) -> None:
     """List all projects in your personal namespace, then schedule each for deletion.
 
     Covers only projects under <your-username>/ (not group projects you are a member
     of); your user account itself is not touched.
     """
-    _execute("user", None, CommonOptions(url=url, token=token, dry_run=dry_run))
+    _execute(
+        "user",
+        None,
+        CommonOptions(url=url, token=token, dry_run=dry_run, purge_registry=purge_registry),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -8,8 +8,9 @@ from __future__ import annotations
 import logging
 
 import gitlab
+from gitlab.exceptions import GitlabListError
 
-from geri.models import GroupNode, ProjectNode, UserNamespaceNode
+from geri.models import GroupNode, ProjectNode, Registries, RegistryRepository, UserNamespaceNode
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +107,34 @@ class TreeDiscovery:
         node.projects.sort(key=lambda p: p.full_path.lower())
         log.info("User %s: %d project(s) in personal namespace", username, len(node.projects))
         return node
+
+    def get_registries(self, projects: list[ProjectNode]) -> Registries:
+        """Container registry repositories (with tag counts) of ``projects``.
+
+        Only projects that have at least one repository are part of the result. A
+        404 (registry disabled or unavailable) counts as "no repositories"; any other
+        error propagates, so a purge is never planned on incomplete data.
+        """
+        registries: Registries = {}
+        for project in projects:
+            manager = self.gl.projects.get(project.id, lazy=True).repositories
+            try:
+                repos = [
+                    RegistryRepository.from_gl(r)
+                    for r in manager.list(tags_count=True, iterator=True)
+                ]
+            except GitlabListError as exc:
+                if exc.response_code == 404:
+                    continue
+                raise
+            if repos:
+                registries[project.id] = sorted(repos, key=lambda r: r.path.lower())
+        log.info(
+            "Container registry: %d project(s) with repositories out of %d checked",
+            len(registries),
+            len(projects),
+        )
+        return registries
 
     @staticmethod
     def _owner_by_path(project: ProjectNode, groups: dict[int, GroupNode]) -> GroupNode | None:

@@ -8,7 +8,7 @@ import pytest
 from gitlab.exceptions import GitlabGetError, GitlabListError
 
 from geri.discovery import TreeDiscovery
-from geri.models import GroupNode, ProjectNode, UserNamespaceNode
+from geri.models import GroupNode, ProjectNode, RegistryRepository, UserNamespaceNode
 
 # --------------------------------------------------------------------------- fakes
 
@@ -219,3 +219,47 @@ def test_user_namespace_authenticates_when_needed():
     node = TreeDiscovery(gl).get_user_namespace()
     assert node.username == "bob"
     assert [p.full_path for p in node.projects] == ["bob/x"]
+
+
+# --------------------------------------------------------------------------- registries
+
+
+class FakeLazyProjects:
+    def __init__(self, managers):
+        self.managers = managers
+
+    def get(self, project_id, lazy=False, **kwargs):
+        assert lazy is True
+        return SimpleNamespace(repositories=self.managers[project_id])
+
+
+def test_get_registries_collects_only_projects_with_repositories():
+    managers = {
+        1: FakeListManager(
+            [
+                SimpleNamespace(id=5, path="g/p1/zeta", tags_count=4),
+                SimpleNamespace(id=6, path="g/p1/Alpha", tags_count=0),
+            ]
+        ),
+        2: FakeListManager([]),
+        3: FakeListManager([], error=GitlabListError("404 Not Found", response_code=404)),
+    }
+    gl = SimpleNamespace(projects=FakeLazyProjects(managers))
+    nodes = [ProjectNode(id=i, full_path=f"g/p{i}", name=f"p{i}") for i in (1, 2, 3)]
+
+    registries = TreeDiscovery(gl).get_registries(nodes)
+
+    assert registries == {
+        1: [
+            RegistryRepository(id=6, path="g/p1/Alpha", tags_count=0),
+            RegistryRepository(id=5, path="g/p1/zeta", tags_count=4),
+        ]
+    }
+    assert managers[1].calls == [{"tags_count": True, "iterator": True}]
+
+
+def test_get_registries_other_errors_propagate():
+    managers = {1: FakeListManager([], error=GitlabListError("500", response_code=500))}
+    gl = SimpleNamespace(projects=FakeLazyProjects(managers))
+    with pytest.raises(GitlabListError):
+        TreeDiscovery(gl).get_registries([ProjectNode(id=1, full_path="g/p", name="p")])

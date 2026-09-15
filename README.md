@@ -80,16 +80,20 @@ geri project <PROJECT_ID_OR_PATH>      # e.g. 5678 or faculty/course/repo
 # All projects in your personal namespace (<your-username>/...)
 geri user
 
+# Projects with container registry images: delete the images first
+geri project faculty/course/app --purge-registry
+
 # Only look, never prompt or delete
 geri group faculty/course --dry-run
 ```
 
-| Option           | Description                                                                     |
-|------------------|---------------------------------------------------------------------------------|
-| `--url URL`      | GitLab base URL (overrides `GITLAB_URL`)                                        |
-| `--token TOKEN`  | Personal access token (overrides `GITLAB_TOKEN`)                                |
-| `--dry-run`      | Only list what would be deleted; no prompt, no delete                           |
-| `--no-subgroups` | `group` only: keep the group and its subgroups, delete only its direct projects |
+| Option             | Description                                                                          |
+|--------------------|--------------------------------------------------------------------------------------|
+| `--url URL`        | GitLab base URL (overrides `GITLAB_URL`)                                             |
+| `--token TOKEN`    | Personal access token (overrides `GITLAB_TOKEN`)                                     |
+| `--dry-run`        | Only list what would be deleted; no prompt, no delete                                |
+| `--no-subgroups`   | `group` only: keep the group and its subgroups, delete only its direct projects      |
+| `--purge-registry` | Delete the projects' container registry images first (**permanent**, see Notes)     |
 
 Each run prints who the token authenticates as and the tree of what would be
 deleted. `group` and `project` end with a one-line result; `user` and
@@ -130,6 +134,18 @@ delete), `1` a deletion request failed (for `user` / `--no-subgroups`: at least 
   **immediately**, even where group projects are only scheduled — the summary
   shows `deleting` instead of `scheduled` in that case, so try
   `geri project <your-username>/<something-unimportant>` first if unsure.
+- **Container registry** (`--purge-registry`): GitLab refuses to delete a
+  project whose container registry still holds tags ("Cannot rename or delete
+  project because it contains container registry tags"); without the option
+  Geri reports that failure and points you at `--purge-registry`. With it, Geri
+  lists the registry repositories (with tag counts) of every project that is
+  about to be deleted below that project in the tree, deletes them after your
+  confirmation, **waits until GitLab has removed them** (up to 10 minutes), and
+  only then deletes the project or group. A project whose purge fails or does
+  not finish in time is not deleted, and a group is not deleted if any of its
+  projects' purges failed. **Registry images are deleted immediately and
+  permanently** — delayed deletion does not cover them, and Freki does not back
+  them up; `docker pull` anything you still need first.
 - **Confirmation** requires typing the exact full path of the target. Anything
   else — including an empty answer, Ctrl+C or a closed stdin — aborts with
   exit code `3`.

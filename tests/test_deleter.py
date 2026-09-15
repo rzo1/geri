@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from gitlab.exceptions import GitlabDeleteError, GitlabGetError
+from gitlab.exceptions import GitlabDeleteError, GitlabGetError, GitlabListError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from geri.deleter import Deleter
-from geri.models import GroupNode, ProjectNode
+from geri.models import GroupNode, ProjectNode, RegistryRepository
 
 
 class FakeManager:
@@ -117,3 +117,208 @@ def test_delete_projects_continues_after_failure():
 
     assert projects.deleted == [1, 3]
     assert [r.status for r in results] == ["scheduled", "failed", "scheduled"]
+
+
+# --------------------------------------------------------------------------- registry purge
+
+
+class FakeRepoManager:
+    """Registry repositories of one project; deleted ones vanish after ``lag`` polls."""
+
+    def __init__(self, repos, *, lag=1, delete_error=None, list_errors=(), status=None):
+        self.repos = {r.id: r for r in repos}
+        self.lag = lag
+        self.delete_error = delete_error
+        self.list_errors = list(list_errors)
+        self.status = status
+        self.deleted: list[int] = []
+        self.polls = 0
+
+    def delete(self, repo_id, **kwargs):
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.deleted.append(repo_id)
+
+    def list(self, **kwargs):
+        self.polls += 1
+        if self.list_errors:
+            raise self.list_errors.pop(0)
+        if self.polls > self.lag:
+            for repo_id in self.deleted:
+                self.repos.pop(repo_id, None)
+        return iter(
+            SimpleNamespace(
+                id=r.id, path=r.path, status=self.status if r.id in self.deleted else None
+            )
+            for r in self.repos.values()
+        )
+
+
+class FakeProjects(FakeManager):
+    """gl.projects with per-project registry managers for lazy gets."""
+
+    def __init__(self, repo_managers, **kwargs):
+        super().__init__(**kwargs)
+        self.repo_managers = repo_managers
+
+    def get(self, obj_id, lazy=False, **kwargs):
+        if lazy:
+            return SimpleNamespace(repositories=self.repo_managers[obj_id])
+        return super().get(obj_id, **kwargs)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def repo(rid, path="img", tags=2):
+    return RegistryRepository(id=rid, path=path, tags_count=tags)
+
+
+def make_deleter(projects, clock, timeout=60.0):
+    return Deleter(
+        SimpleNamespace(projects=projects, groups=projects),
+        registry_timeout=timeout,
+        poll_interval=5.0,
+        sleep=clock.sleep,
+        clock=clock,
+    )
+
+
+SCHEDULED = SimpleNamespace(marked_for_deletion_on="2026-09-22")
+
+
+def test_purge_waits_until_repositories_are_gone_then_deletes():
+    repos = FakeRepoManager([repo(1, "a"), repo(2, "b")], lag=2)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    clock = FakeClock()
+
+    result = make_deleter(projects, clock).delete_project(PROJECT, {7: [repo(1), repo(2)]})
+
+    assert repos.deleted == [1, 2]
+    assert clock.sleeps == [5.0, 5.0]
+    assert projects.deleted == [7]
+    assert result.status == "scheduled"
+
+
+def test_purge_delete_error_keeps_project():
+    repos = FakeRepoManager(
+        [repo(1)], delete_error=GitlabDeleteError("403 Forbidden", response_code=403)
+    )
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+
+    result = make_deleter(projects, FakeClock()).delete_project(PROJECT, {7: [repo(1)]})
+
+    assert result.status == "failed"
+    assert "registry purge failed" in result.message and "403" in result.message
+    assert projects.deleted == []
+
+
+def test_purge_timeout_keeps_project():
+    repos = FakeRepoManager([repo(1)], lag=10_000)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    clock = FakeClock()
+
+    result = make_deleter(projects, clock, timeout=12).delete_project(PROJECT, {7: [repo(1)]})
+
+    assert result.status == "failed"
+    assert "still running after 12s" in result.message
+    assert projects.deleted == []
+    assert clock.now >= 12
+
+
+def test_purge_delete_failed_status_is_reported():
+    repos = FakeRepoManager([repo(1, "broken")], lag=10_000, status="delete_failed")
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+
+    result = make_deleter(projects, FakeClock()).delete_project(PROJECT, {7: [repo(1)]})
+
+    assert result.status == "failed"
+    assert "GitLab failed to delete registry repository broken" in result.message
+    assert projects.deleted == []
+
+
+def test_purge_transient_list_errors_are_retried():
+    repos = FakeRepoManager(
+        [repo(1)],
+        lag=0,
+        list_errors=[RequestsConnectionError("reset"), GitlabListError("502", response_code=502)],
+    )
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    clock = FakeClock()
+
+    result = make_deleter(projects, clock).delete_project(PROJECT, {7: [repo(1)]})
+
+    assert result.status == "scheduled"
+    assert len(clock.sleeps) == 2
+
+
+def test_purge_registry_404_counts_as_gone():
+    repos = FakeRepoManager([repo(1)], list_errors=[GitlabListError("404", response_code=404)])
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    result = make_deleter(projects, FakeClock()).delete_project(PROJECT, {7: [repo(1)]})
+    assert result.status == "scheduled"
+
+
+def test_delete_projects_skips_only_projects_whose_purge_failed():
+    ok = FakeRepoManager([repo(1)], lag=0)
+    bad = FakeRepoManager([repo(2)], delete_error=GitlabDeleteError("400", response_code=400))
+    projects = FakeProjects({1: ok, 2: bad}, after=SCHEDULED)
+    nodes = [ProjectNode(id=i, full_path=f"alice/p{i}", name=f"p{i}") for i in (1, 2, 3)]
+
+    results = make_deleter(projects, FakeClock()).delete_projects(
+        nodes, {1: [repo(1)], 2: [repo(2)]}
+    )
+
+    assert [r.status for r in results] == ["scheduled", "failed", "scheduled"]
+    assert projects.deleted == [1, 3]
+
+
+def test_group_is_not_deleted_when_a_purge_fails():
+    bad = FakeRepoManager([repo(2)], delete_error=GitlabDeleteError("400", response_code=400))
+    projects = FakeProjects({11: bad}, after=SCHEDULED)
+    group = GroupNode(
+        id=42,
+        full_path="top",
+        name="top",
+        projects=[ProjectNode(id=11, full_path="top/app", name="app")],
+    )
+
+    result = make_deleter(projects, FakeClock()).delete_group(group, {11: [repo(2)]})
+
+    assert result.status == "failed"
+    assert result.message.startswith("top/app: registry purge failed")
+    assert projects.deleted == []
+
+
+def test_group_is_deleted_after_successful_purge():
+    ok = FakeRepoManager([repo(2)], lag=0)
+    projects = FakeProjects({11: ok}, after=SCHEDULED)
+    group = GroupNode(
+        id=42,
+        full_path="top",
+        name="top",
+        subgroups=[
+            GroupNode(
+                id=43,
+                full_path="top/sub",
+                name="sub",
+                projects=[ProjectNode(id=11, full_path="top/sub/app", name="app")],
+            )
+        ],
+    )
+
+    result = make_deleter(projects, FakeClock()).delete_group(group, {11: [repo(2)]})
+
+    assert ok.deleted == [2]
+    assert projects.deleted == [42]  # groups and projects share the fake manager
+    assert result.status == "scheduled"
