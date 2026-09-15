@@ -14,8 +14,8 @@ you to confirm by typing the target's full path, and only then sends the
 deletion request. Works with any self-hosted GitLab or gitlab.com,
 authenticated by a personal access token (PAT).
 
-Companion to [Freki](https://github.com/rzo1/freki): back it up with Freki,
-then let Geri clean up.
+Twin of [Freki](https://github.com/rzo1/freki), Odin's other wolf: back
+everything up with Freki first, then let Geri clean up.
 
 ```
 $ geri group faculty/course-2025
@@ -94,8 +94,8 @@ skipped).
 
 Exit codes: `0` success (or dry run / already scheduled / nothing left to
 delete), `1` a deletion request failed (for `user`: at least one project),
-`2` configuration, authentication or "not found" errors, `3` confirmation not
-given — nothing was deleted.
+`2` configuration, authentication, connection or "not found" errors,
+`3` confirmation not given — nothing was deleted.
 
 ## Notes
 
