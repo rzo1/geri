@@ -1,6 +1,6 @@
 [project]
 name = "geri"
-version = "0.1.0"
+version = "0.1.1"
 description = "Geri, Odin's ravenous wolf: tears down GitLab groups and projects (schedules them for deletion)"
 readme = "README.md"
 authors = [
