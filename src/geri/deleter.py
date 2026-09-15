@@ -156,6 +156,14 @@ class Deleter:
             manager = self._lazy_project(project.id).repositories
             try:
                 for repo in repos:
+                    if repo.deleting:
+                        # Requested by an earlier run; asking again would only fail.
+                        log.info(
+                            "%s: registry repository %s is already being deleted",
+                            project.full_path,
+                            repo.path,
+                        )
+                        continue
                     manager.delete(repo.id)
                     log.info(
                         "%s: deleting container registry repository %s",
@@ -188,8 +196,8 @@ class Deleter:
             if self._clock() >= deadline:
                 for project, _ in waiting.values():
                     errors[project.full_path] = (
-                        f"registry purge still running after {self.registry_timeout:.0f}s; "
-                        "project not deleted, re-run later"
+                        "GitLab is still removing the registry images (waited "
+                        f"{self.registry_timeout:.0f}s); project not deleted, re-run later"
                     )
                 break
             log.info(

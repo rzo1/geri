@@ -83,17 +83,21 @@ geri user
 # Projects with container registry images: delete the images first
 geri project faculty/course/app --purge-registry
 
+# Only request the image purge, don't wait; re-run later to delete the project
+geri group faculty/course --purge-registry --registry-timeout 0
+
 # Only look, never prompt or delete
 geri group faculty/course --dry-run
 ```
 
-| Option             | Description                                                                          |
-|--------------------|--------------------------------------------------------------------------------------|
-| `--url URL`        | GitLab base URL (overrides `GITLAB_URL`)                                             |
-| `--token TOKEN`    | Personal access token (overrides `GITLAB_TOKEN`)                                     |
-| `--dry-run`        | Only list what would be deleted; no prompt, no delete                                |
-| `--no-subgroups`   | `group` only: keep the group and its subgroups, delete only its direct projects      |
-| `--purge-registry` | Delete the projects' container registry images first (**permanent**, see Notes)     |
+| Option                       | Description                                                                         |
+|------------------------------|-------------------------------------------------------------------------------------|
+| `--url URL`                  | GitLab base URL (overrides `GITLAB_URL`)                                            |
+| `--token TOKEN`              | Personal access token (overrides `GITLAB_TOKEN`)                                    |
+| `--dry-run`                  | Only list what would be deleted; no prompt, no delete                               |
+| `--no-subgroups`             | `group` only: keep the group and its subgroups, delete only its direct projects     |
+| `--purge-registry`           | Delete the projects' container registry images first (**permanent**, see Notes)     |
+| `--registry-timeout SECONDS` | How long to wait for GitLab to remove purged images (default `600`, `0` = no wait)  |
 
 Each run prints who the token authenticates as and the tree of what would be
 deleted. `group` and `project` end with a one-line result; `user` and
@@ -140,12 +144,17 @@ delete), `1` a deletion request failed (for `user` / `--no-subgroups`: at least 
   Geri reports that failure and points you at `--purge-registry`. With it, Geri
   lists the registry repositories (with tag counts) of every project that is
   about to be deleted below that project in the tree, deletes them after your
-  confirmation, **waits until GitLab has removed them** (up to 10 minutes), and
-  only then deletes the project or group. Archived projects are read-only, so
+  confirmation, **waits until GitLab has removed them** (up to
+  `--registry-timeout`, 10 minutes by default), and only then deletes the
+  project or group. Archived projects are read-only, so
   GitLab refuses to delete their images; Geri unarchives them for the purge and
   archives them again right afterwards (marked in the tree). A project whose
   purge fails or does not finish in time is not deleted, and a group is not
-  deleted if any of its projects' purges failed. **Registry images are deleted immediately and
+  deleted if any of its projects' purges failed. GitLab can take hours or days
+  to remove images; simply **re-run the same command later**: repositories it
+  is already deleting are shown as "deletion already in progress" and only
+  waited for (not requested again), repositories whose earlier deletion failed
+  are retried, and once they are gone the project is deleted. **Registry images are deleted immediately and
   permanently** — delayed deletion does not cover them, and Freki does not back
   them up; `docker pull` anything you still need first.
 - **Confirmation** requires typing the exact full path of the target. Anything

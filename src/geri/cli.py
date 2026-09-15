@@ -20,7 +20,7 @@ from rich.tree import Tree
 
 from geri import __version__
 from geri.config import Settings, get_client
-from geri.deleter import Deleter, DeletionResult
+from geri.deleter import REGISTRY_TIMEOUT, Deleter, DeletionResult
 from geri.discovery import TreeDiscovery
 from geri.models import GroupNode, ProjectNode, Registries, UserNamespaceNode
 
@@ -83,6 +83,18 @@ NoSubgroupsOpt = Annotated[
         ),
     ),
 ]
+RegistryTimeoutOpt = Annotated[
+    int,
+    typer.Option(
+        "--registry-timeout",
+        min=0,
+        metavar="SECONDS",
+        help=(
+            "With --purge-registry: how long to wait for GitLab to remove the images before "
+            "giving up on those projects (0 = only request the purge; re-run later)."
+        ),
+    ),
+]
 PurgeRegistryOpt = Annotated[
     bool,
     typer.Option(
@@ -104,6 +116,7 @@ class CommonOptions:
     dry_run: bool = False
     no_subgroups: bool = False
     purge_registry: bool = False
+    registry_timeout: int = int(REGISTRY_TIMEOUT)
 
     def to_settings(self) -> Settings:
         """Build ``Settings`` from env/.env, overridden by the given CLI values."""
@@ -185,9 +198,15 @@ def _add_registries(branch: Tree, project: ProjectNode, registries: Registries) 
             "[yellow]unarchived temporarily for the purge, archived again afterwards[/yellow]"
         )
     for repo in registries.get(project.id, []):
+        if repo.deleting:
+            state = "[yellow]deletion already in progress[/yellow]"
+        elif repo.status == "delete_failed":
+            state = "[red]earlier deletion failed; retried, purged permanently[/red]"
+        else:
+            state = "[red]purged permanently[/red]"
         branch.add(
-            f"[magenta]registry[/magenta] {escape(repo.path)} [dim]({_tags(repo.tags_count)})"
-            "[/dim] [red]purged permanently[/red]"
+            f"[magenta]registry[/magenta] {escape(repo.path)} "
+            f"[dim]({_tags(repo.tags_count)})[/dim] {state}"
         )
 
 
@@ -479,7 +498,7 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
         console.print("[yellow]Confirmation did not match. Nothing was deleted.[/yellow]")
         raise typer.Exit(EXIT_ABORTED)
 
-    deleter = Deleter(client)
+    deleter = Deleter(client, registry_timeout=opts.registry_timeout)
     if bulk:
         results = deleter.delete_projects(pending, registries)
         console.print(_summary_table(results, opts.purge_registry))
@@ -531,6 +550,7 @@ def group(
     dry_run: DryRunOpt = False,
     no_subgroups: NoSubgroupsOpt = False,
     purge_registry: PurgeRegistryOpt = False,
+    registry_timeout: RegistryTimeoutOpt = int(REGISTRY_TIMEOUT),
 ) -> None:
     """List a group with all subgroups and projects, then schedule it for deletion.
 
@@ -546,6 +566,7 @@ def group(
             dry_run=dry_run,
             no_subgroups=no_subgroups,
             purge_registry=purge_registry,
+            registry_timeout=registry_timeout,
         ),
     )
 
@@ -559,12 +580,19 @@ def project(
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
     purge_registry: PurgeRegistryOpt = False,
+    registry_timeout: RegistryTimeoutOpt = int(REGISTRY_TIMEOUT),
 ) -> None:
     """Show a project, then schedule it for deletion."""
     _execute(
         "project",
         project_id_or_path,
-        CommonOptions(url=url, token=token, dry_run=dry_run, purge_registry=purge_registry),
+        CommonOptions(
+            url=url,
+            token=token,
+            dry_run=dry_run,
+            purge_registry=purge_registry,
+            registry_timeout=registry_timeout,
+        ),
     )
 
 
@@ -574,6 +602,7 @@ def user(
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
     purge_registry: PurgeRegistryOpt = False,
+    registry_timeout: RegistryTimeoutOpt = int(REGISTRY_TIMEOUT),
 ) -> None:
     """List all projects in your personal namespace, then schedule each for deletion.
 
@@ -583,7 +612,13 @@ def user(
     _execute(
         "user",
         None,
-        CommonOptions(url=url, token=token, dry_run=dry_run, purge_registry=purge_registry),
+        CommonOptions(
+            url=url,
+            token=token,
+            dry_run=dry_run,
+            purge_registry=purge_registry,
+            registry_timeout=registry_timeout,
+        ),
     )
 
 

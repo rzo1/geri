@@ -247,7 +247,8 @@ def test_purge_timeout_keeps_project():
     result = make_deleter(projects, clock, timeout=12).delete_project(PROJECT, {7: [repo(1)]})
 
     assert result.status == "failed"
-    assert "still running after 12s" in result.message
+    assert "still removing the registry images (waited 12s)" in result.message
+    assert "re-run later" in result.message
     assert projects.deleted == []
     assert clock.now >= 12
 
@@ -382,3 +383,34 @@ def test_active_project_is_not_unarchived():
     projects = FakeProjects({7: repos}, after=SCHEDULED)
     make_deleter(projects, FakeClock()).delete_project(PROJECT, {7: [repo(1)]})
     assert projects.events == [("delete", 7)]
+
+
+def test_repositories_already_being_deleted_are_only_waited_for():
+    repos = FakeRepoManager([repo(1), repo(2)], lag=0)
+    repos.deleted = [1]  # requested by an earlier run
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    registries = {
+        7: [
+            RegistryRepository(id=1, path="a", tags_count=2, status="delete_scheduled"),
+            RegistryRepository(id=2, path="b", tags_count=2, status="delete_failed"),
+        ]
+    }
+
+    result = make_deleter(projects, FakeClock()).delete_project(PROJECT, registries)
+
+    assert repos.deleted == [1, 2]  # only the failed one was requested again
+    assert result.status == "scheduled"
+
+
+def test_zero_timeout_checks_once_and_keeps_project():
+    repos = FakeRepoManager([repo(1)], lag=10_000)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    clock = FakeClock()
+
+    result = make_deleter(projects, clock, timeout=0).delete_project(PROJECT, {7: [repo(1)]})
+
+    assert repos.deleted == [1]
+    assert repos.polls == 1
+    assert clock.sleeps == []
+    assert result.status == "failed" and "re-run later" in result.message
+    assert projects.deleted == []

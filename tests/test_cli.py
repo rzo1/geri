@@ -94,9 +94,11 @@ class FakeDeleter:
     messages: dict[int, str] = {}
     calls: list[tuple] = []
     registries: list = []
+    timeouts: list = []
 
-    def __init__(self, gl) -> None:
+    def __init__(self, gl, registry_timeout=None) -> None:
         self.gl = gl
+        FakeDeleter.timeouts.append(registry_timeout)
 
     def _result(self, kind, node):
         FakeDeleter.calls.append((kind, node.id))
@@ -148,6 +150,7 @@ def patched(monkeypatch, tmp_path):
     FakeDeleter.failing = set()
     FakeDeleter.messages = {}
     FakeDeleter.registries = []
+    FakeDeleter.timeouts = []
     monkeypatch.setattr(cli, "get_client", fake_get_client)
     monkeypatch.setattr(cli, "TreeDiscovery", FakeDiscovery)
     monkeypatch.setattr(cli, "Deleter", FakeDeleter)
@@ -452,3 +455,32 @@ def test_purge_registry_marks_archived_projects_as_temporarily_unarchived():
     )
     assert result.exit_code == 0, result.output
     assert "unarchived temporarily for the purge" in result.output
+
+
+def test_registry_timeout_default_and_override():
+    runner.invoke(cli.app, ["project", "top/solo", "--purge-registry"], input="top/solo\n")
+    runner.invoke(
+        cli.app,
+        ["project", "top/solo", "--purge-registry", "--registry-timeout", "0"],
+        input="top/solo\n",
+    )
+    assert FakeDeleter.timeouts == [600, 0]
+
+
+def test_registry_timeout_rejects_negative_values():
+    result = runner.invoke(cli.app, ["user", "--registry-timeout", "-1"])
+    assert result.exit_code == 2
+    assert FakeDeleter.calls == []
+
+
+def test_tree_shows_registry_deletion_state():
+    FakeDiscovery.registries = {
+        5: [
+            RegistryRepository(id=1, path="top/solo/a", tags_count=2, status="delete_ongoing"),
+            RegistryRepository(id=2, path="top/solo/b", tags_count=1, status="delete_failed"),
+        ]
+    }
+    result = runner.invoke(cli.app, ["project", "top/solo", "--purge-registry", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "deletion already in progress" in result.output
+    assert "earlier deletion failed; retried" in result.output

@@ -263,3 +263,11 @@ def test_get_registries_other_errors_propagate():
     gl = SimpleNamespace(projects=FakeLazyProjects(managers))
     with pytest.raises(GitlabListError):
         TreeDiscovery(gl).get_registries([ProjectNode(id=1, full_path="g/p", name="p")])
+
+
+def test_registry_repository_status():
+    queued = RegistryRepository.from_gl(SimpleNamespace(id=1, path="p", status="delete_scheduled"))
+    fresh = RegistryRepository.from_gl(SimpleNamespace(id=2, path="p", status=None))
+    assert queued.status == "delete_scheduled" and queued.deleting is True
+    assert fresh.status is None and fresh.deleting is False
+    assert RegistryRepository(id=3, path="p", status="delete_failed").deleting is False

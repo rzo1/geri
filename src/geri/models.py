@@ -108,6 +108,13 @@ class RegistryRepository:
     id: int
     path: str
     tags_count: int | None = None
+    status: str | None = None
+    """``None``, or GitLab's ``delete_scheduled`` / ``delete_ongoing`` / ``delete_failed``."""
+
+    @property
+    def deleting(self) -> bool:
+        """GitLab is already removing this repository (e.g. from an earlier run)."""
+        return self.status in ("delete_scheduled", "delete_ongoing")
 
     @classmethod
     def from_gl(cls, repository: Any) -> RegistryRepository:
@@ -116,6 +123,7 @@ class RegistryRepository:
             id=int(repository.id),
             path=str(getattr(repository, "path", None) or repository.id),
             tags_count=int(tags_count) if tags_count is not None else None,
+            status=getattr(repository, "status", None) or None,
         )
 
 
