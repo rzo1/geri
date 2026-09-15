@@ -73,6 +73,16 @@ DryRunOpt = Annotated[
     bool,
     typer.Option("--dry-run", help="Only list what would be deleted; do not prompt or delete."),
 ]
+NoSubgroupsOpt = Annotated[
+    bool,
+    typer.Option(
+        "--no-subgroups",
+        help=(
+            "Keep the group and all its subgroups (with their projects); only schedule the "
+            "projects directly in the group for deletion, one by one."
+        ),
+    ),
+]
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,7 @@ class CommonOptions:
     url: str | None = None
     token: str | None = None
     dry_run: bool = False
+    no_subgroups: bool = False
 
     def to_settings(self) -> Settings:
         """Build ``Settings`` from env/.env, overridden by the given CLI values."""
@@ -148,11 +159,20 @@ def _user_label(namespace: UserNamespaceNode) -> str:
     )
 
 
+def _kept_label(group: GroupNode) -> str:
+    inside = f"{len(group.walk_groups())} subgroup(s), {len(group.walk_projects())} project(s)"
+    return f"{_group_label(group)} [green]kept ({inside} inside)[/green]"
+
+
 Target = GroupNode | ProjectNode | UserNamespaceNode
 
 
-def build_tree(target: Target) -> Tree:
-    """Rich tree of ``target``: subgroups first, then projects, both sorted by path."""
+def build_tree(target: Target, keep_subgroups: bool = False) -> Tree:
+    """Rich tree of ``target``: subgroups first, then projects, both sorted by path.
+
+    With ``keep_subgroups`` the subgroups of a group are shown collapsed and marked
+    as kept instead of being expanded.
+    """
     if isinstance(target, ProjectNode):
         return Tree(_project_label(target))
     if isinstance(target, UserNamespaceNode):
@@ -168,6 +188,12 @@ def build_tree(target: Target) -> Tree:
             branch.add(_project_label(project))
 
     tree = Tree(_group_label(target))
+    if keep_subgroups:
+        for sub in target.subgroups:
+            tree.add(_kept_label(sub))
+        for project in target.projects:
+            tree.add(_project_label(project))
+        return tree
     add(tree, target)
     return tree
 
@@ -194,13 +220,20 @@ def _describe_contents(target: GroupNode | UserNamespaceNode) -> str:
     )
 
 
-def _confirm(kind: str, target: Target, pending: list[ProjectNode]) -> bool:
+def _confirm(kind: str, target: Target, pending: list[ProjectNode], keep_subgroups: bool) -> bool:
     """Ask the user to type the target's full path; return whether it matched."""
     if isinstance(target, UserNamespaceNode):
         what = (
             f"[bold]{len(pending)} project(s)[/bold] in the personal namespace "
             f"[bold]{escape(target.username)}[/bold] for deletion, one by one (all listed "
             "above except those already scheduled). Your user account itself is not touched"
+        )
+    elif isinstance(target, GroupNode) and keep_subgroups:
+        what = (
+            f"[bold]{len(pending)} project(s)[/bold] directly in group "
+            f"[bold]{escape(target.full_path)}[/bold] for deletion, one by one (all listed "
+            "above except those already scheduled). The group itself and its "
+            f"{len(target.subgroups)} subgroup(s) marked as kept are not touched"
         )
     else:
         what = f"{kind} [bold]{escape(target.full_path)}[/bold]"
@@ -320,14 +353,22 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
     except (GitlabError, RequestException) as exc:
         _fail(f"listing {label} failed: {exc}")
 
-    console.print(build_tree(target))
-    if isinstance(target, GroupNode):
+    keep_subgroups = opts.no_subgroups and isinstance(target, GroupNode)
+    console.print(build_tree(target, keep_subgroups=keep_subgroups))
+    if keep_subgroups:
+        console.print(
+            f"Group contains {_describe_projects(target.projects)} directly; its "
+            f"{len(target.subgroups)} subgroup(s) are kept."
+        )
+    elif isinstance(target, GroupNode):
         console.print(f"Group contains {_describe_contents(target)}.")
     elif isinstance(target, UserNamespaceNode):
         console.print(f"Personal namespace contains {_describe_contents(target)}.")
 
+    # Project-by-project mode: personal namespaces, and groups whose subgroups are kept.
+    bulk = keep_subgroups or isinstance(target, UserNamespaceNode)
     pending: list[ProjectNode] = []
-    if isinstance(target, UserNamespaceNode):
+    if bulk:
         pending = [p for p in target.projects if not p.marked_for_deletion_on]
         if not pending:
             console.print("[yellow]No projects left to delete; nothing to do.[/yellow]")
@@ -343,12 +384,12 @@ def _execute(kind: str, target_ref: str | None, opts: CommonOptions) -> None:
         console.print("[yellow]Dry run:[/yellow] nothing will be deleted.")
         raise typer.Exit(EXIT_OK)
 
-    if not _confirm(kind, target, pending):
+    if not _confirm(kind, target, pending, keep_subgroups):
         console.print("[yellow]Confirmation did not match. Nothing was deleted.[/yellow]")
         raise typer.Exit(EXIT_ABORTED)
 
     deleter = Deleter(client)
-    if isinstance(target, UserNamespaceNode):
+    if bulk:
         results = deleter.delete_projects(pending)
         console.print(_summary_table(results))
         if _print_counts(results, skipped=len(target.projects) - len(pending)):
@@ -397,9 +438,18 @@ def group(
     url: UrlOpt = None,
     token: TokenOpt = None,
     dry_run: DryRunOpt = False,
+    no_subgroups: NoSubgroupsOpt = False,
 ) -> None:
-    """List a group with all subgroups and projects, then schedule it for deletion."""
-    _execute("group", group_id_or_path, CommonOptions(url=url, token=token, dry_run=dry_run))
+    """List a group with all subgroups and projects, then schedule it for deletion.
+
+    With --no-subgroups the group and its subgroups are kept and only the projects
+    directly in the group are scheduled for deletion.
+    """
+    _execute(
+        "group",
+        group_id_or_path,
+        CommonOptions(url=url, token=token, dry_run=dry_run, no_subgroups=no_subgroups),
+    )
 
 
 @app.command()

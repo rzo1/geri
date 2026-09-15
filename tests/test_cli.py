@@ -302,3 +302,49 @@ def test_user_partial_failure_exit_code():
     assert result.exit_code == cli.EXIT_FAILED, result.output
     assert FakeDeleter.calls == [("project", 20), ("project", 22)]
     assert "1 failed" in result.output and "1 scheduled" in result.output
+
+
+# --------------------------------------------------------------------------- group --no-subgroups
+
+
+def test_group_no_subgroups_deletes_only_direct_projects():
+    result = runner.invoke(cli.app, ["group", "top", "--no-subgroups"], input="top\n")
+    assert result.exit_code == 0, result.output
+    assert "kept (0 subgroup(s), 1 project(s) inside)" in result.output
+    assert "top/sub/deep-repo" not in result.output  # kept subgroups are shown collapsed
+    assert "1 project(s) (1 archived) directly; its 1 subgroup(s) are kept" in result.output
+    assert FakeDeleter.calls == [("project", 10)]  # never the group, never subgroup projects
+    assert "Summary" in result.output and "1 scheduled" in result.output
+
+
+def test_group_no_subgroups_dry_run():
+    result = runner.invoke(cli.app, ["group", "top", "--no-subgroups", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "kept" in result.output and "top/repo" in result.output
+    assert "Type the full path" not in result.output
+    assert FakeDeleter.calls == []
+
+
+def test_group_no_subgroups_wrong_confirmation():
+    result = runner.invoke(cli.app, ["group", "top", "--no-subgroups"], input="top/sub\n")
+    assert result.exit_code == cli.EXIT_ABORTED, result.output
+    assert FakeDeleter.calls == []
+
+
+def test_group_no_subgroups_without_direct_projects():
+    FakeDiscovery.tree.projects = []
+    result = runner.invoke(cli.app, ["group", "top", "--no-subgroups"])
+    assert result.exit_code == 0, result.output
+    assert "nothing to do" in result.output
+    assert FakeDeleter.calls == []
+
+
+def test_group_no_subgroups_skips_already_scheduled_projects():
+    FakeDiscovery.tree.projects.append(
+        ProjectNode(id=12, full_path="top/gone", name="gone", marked_for_deletion_on="2026-09-20")
+    )
+    FakeDeleter.failing = {10}
+    result = runner.invoke(cli.app, ["group", "top", "--no-subgroups"], input="top\n")
+    assert result.exit_code == cli.EXIT_FAILED, result.output
+    assert FakeDeleter.calls == [("project", 10)]
+    assert "1 skipped (already scheduled)" in result.output

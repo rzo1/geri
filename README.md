@@ -71,6 +71,9 @@ directory (see `.env.example`). CLI flags always take precedence.
 # A group, including all its subgroups and projects
 geri group <GROUP_ID_OR_PATH>          # e.g. 1234 or faculty/course
 
+# Only the projects directly in a group; the group and its subgroups are kept
+geri group <GROUP_ID_OR_PATH> --no-subgroups
+
 # A single project
 geri project <PROJECT_ID_OR_PATH>      # e.g. 5678 or faculty/course/repo
 
@@ -81,19 +84,20 @@ geri user
 geri group faculty/course --dry-run
 ```
 
-| Option          | Description                                          |
-|-----------------|------------------------------------------------------|
-| `--url URL`     | GitLab base URL (overrides `GITLAB_URL`)             |
-| `--token TOKEN` | Personal access token (overrides `GITLAB_TOKEN`)     |
-| `--dry-run`     | Only list what would be deleted; no prompt, no delete |
+| Option           | Description                                                                     |
+|------------------|---------------------------------------------------------------------------------|
+| `--url URL`      | GitLab base URL (overrides `GITLAB_URL`)                                        |
+| `--token TOKEN`  | Personal access token (overrides `GITLAB_TOKEN`)                                |
+| `--dry-run`      | Only list what would be deleted; no prompt, no delete                           |
+| `--no-subgroups` | `group` only: keep the group and its subgroups, delete only its direct projects |
 
 Each run prints who the token authenticates as and the tree of what would be
-deleted. `group` and `project` end with a one-line result; `user` ends with a
-per-project summary table and totals (scheduled / deletion accepted / failed /
+deleted. `group` and `project` end with a one-line result; `user` and
+`group --no-subgroups` end with a per-project summary table and totals (scheduled / deletion accepted / failed /
 skipped).
 
 Exit codes: `0` success (or dry run / already scheduled / nothing left to
-delete), `1` a deletion request failed (for `user`: at least one project),
+delete), `1` a deletion request failed (for `user` / `--no-subgroups`: at least one project),
 `2` configuration, authentication, connection or "not found" errors,
 `3` confirmation not given — nothing was deleted.
 
@@ -109,6 +113,12 @@ delete), `1` a deletion request failed (for `user`: at least one project),
   every subgroup and project along. The tree therefore includes archived
   projects and items already marked for deletion. Projects merely *shared*
   with the group are not part of it, are not listed and are not deleted.
+- **Keeping subgroups** (`geri group <group> --no-subgroups`): GitLab cannot
+  delete a group but spare its subgroups, so instead Geri keeps the group and
+  every subgroup (shown collapsed and marked `kept`, with what is inside) and
+  deletes only the projects **directly** in the group, one by one after a
+  single confirmation. Like `geri user`, failures do not stop the rest and
+  already-scheduled projects are skipped.
 - **Personal namespaces** (`geri user`) cannot be deleted as a whole — GitLab
   only deletes groups, and your namespace belongs to your user account. Geri
   therefore lists every project under `<your-username>/` (archived ones
