@@ -180,6 +180,10 @@ def _tags(count: int | None) -> str:
 
 
 def _add_registries(branch: Tree, project: ProjectNode, registries: Registries) -> None:
+    if project.archived and registries.get(project.id):
+        branch.add(
+            "[yellow]unarchived temporarily for the purge, archived again afterwards[/yellow]"
+        )
     for repo in registries.get(project.id, []):
         branch.add(
             f"[magenta]registry[/magenta] {escape(repo.path)} [dim]({_tags(repo.tags_count)})"

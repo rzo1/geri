@@ -110,24 +110,50 @@ class Deleter:
 
     # ------------------------------------------------------------------ registry
 
-    def _repositories(self, project_id: int) -> Any:
-        return self.gl.projects.get(project_id, lazy=True).repositories
+    def _lazy_project(self, project_id: int) -> Any:
+        return self.gl.projects.get(project_id, lazy=True)
 
     def purge_registries(
         self, projects: list[ProjectNode], registries: Registries
     ) -> dict[str, str]:
         """Delete the registry repositories of ``projects`` and wait until they are gone.
 
+        Archived projects are read-only, so GitLab refuses to delete their images
+        (403). They are unarchived for the purge and archived again afterwards,
+        whatever the outcome, before anything is deleted.
+
         Returns an error message per project path for every purge that failed or
         did not finish within ``registry_timeout``; purged projects are absent.
         """
         errors: dict[str, str] = {}
+        unarchived: list[ProjectNode] = []
+        try:
+            waiting = self._request_purges(projects, registries, errors, unarchived)
+            self._wait_for_purges(waiting, errors)
+        finally:
+            for project in unarchived:
+                self._set_archived(project, archived=True)
+        return errors
+
+    def _request_purges(
+        self,
+        projects: list[ProjectNode],
+        registries: Registries,
+        errors: dict[str, str],
+        unarchived: list[ProjectNode],
+    ) -> dict[int, tuple[ProjectNode, set[int]]]:
         waiting: dict[int, tuple[ProjectNode, set[int]]] = {}
         for project in projects:
             repos = registries.get(project.id) or []
             if not repos:
                 continue
-            manager = self._repositories(project.id)
+            if project.archived:
+                error = self._set_archived(project, archived=False)
+                if error:
+                    errors[project.full_path] = f"registry purge failed: {error}"
+                    continue
+                unarchived.append(project)
+            manager = self._lazy_project(project.id).repositories
             try:
                 for repo in repos:
                     manager.delete(repo.id)
@@ -141,7 +167,11 @@ class Deleter:
                 errors[project.full_path] = f"registry purge failed: {exc}"
                 continue
             waiting[project.id] = (project, {repo.id for repo in repos})
+        return waiting
 
+    def _wait_for_purges(
+        self, waiting: dict[int, tuple[ProjectNode, set[int]]], errors: dict[str, str]
+    ) -> None:
         deadline = self._clock() + self.registry_timeout
         while waiting:
             for project_id, (project, repo_ids) in list(waiting.items()):
@@ -166,13 +196,23 @@ class Deleter:
                 "waiting for GitLab to remove registry images of %d project(s)...", len(waiting)
             )
             self._sleep(self.poll_interval)
-        return errors
+
+    def _set_archived(self, project: ProjectNode, archived: bool) -> str | None:
+        """(Un)archive ``project``; return an error message or ``None``."""
+        action = "archive" if archived else "unarchive"
+        try:
+            getattr(self._lazy_project(project.id), action)()
+        except (GitlabError, RequestException) as exc:
+            log.error("could not %s %s: %s", action, project.full_path, exc)
+            return f"could not {action} project ({exc})"
+        log.info("%s: %sd", project.full_path, action)
+        return None
 
     def _registry_state(self, project_id: int, repo_ids: set[int]) -> str | None:
         """``""`` when all ``repo_ids`` are gone, an error message when GitLab gave up
         on one, ``None`` while removal is still in progress."""
         try:
-            current = list(self._repositories(project_id).list(iterator=True))
+            current = list(self._lazy_project(project_id).repositories.list(iterator=True))
         except GitlabListError as exc:
             if exc.response_code == 404:
                 return ""

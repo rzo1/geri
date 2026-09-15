@@ -141,9 +141,11 @@ delete), `1` a deletion request failed (for `user` / `--no-subgroups`: at least 
   lists the registry repositories (with tag counts) of every project that is
   about to be deleted below that project in the tree, deletes them after your
   confirmation, **waits until GitLab has removed them** (up to 10 minutes), and
-  only then deletes the project or group. A project whose purge fails or does
-  not finish in time is not deleted, and a group is not deleted if any of its
-  projects' purges failed. **Registry images are deleted immediately and
+  only then deletes the project or group. Archived projects are read-only, so
+  GitLab refuses to delete their images; Geri unarchives them for the purge and
+  archives them again right afterwards (marked in the tree). A project whose
+  purge fails or does not finish in time is not deleted, and a group is not
+  deleted if any of its projects' purges failed. **Registry images are deleted immediately and
   permanently** — delayed deletion does not cover them, and Freki does not back
   them up; `docker pull` anything you still need first.
 - **Confirmation** requires typing the exact full path of the target. Anything

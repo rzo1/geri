@@ -161,10 +161,26 @@ class FakeProjects(FakeManager):
         super().__init__(**kwargs)
         self.repo_managers = repo_managers
 
+        self.events: list[tuple] = []
+        self.unarchive_error: Exception | None = None
+
     def get(self, obj_id, lazy=False, **kwargs):
         if lazy:
-            return SimpleNamespace(repositories=self.repo_managers[obj_id])
+            return SimpleNamespace(
+                repositories=self.repo_managers[obj_id],
+                archive=lambda: self.events.append(("archive", obj_id)),
+                unarchive=lambda: self._unarchive(obj_id),
+            )
         return super().get(obj_id, **kwargs)
+
+    def _unarchive(self, obj_id):
+        if self.unarchive_error is not None:
+            raise self.unarchive_error
+        self.events.append(("unarchive", obj_id))
+
+    def delete(self, obj_id, **kwargs):
+        self.events.append(("delete", obj_id))
+        super().delete(obj_id, **kwargs)
 
 
 class FakeClock:
@@ -322,3 +338,47 @@ def test_group_is_deleted_after_successful_purge():
     assert ok.deleted == [2]
     assert projects.deleted == [42]  # groups and projects share the fake manager
     assert result.status == "scheduled"
+
+
+ARCHIVED = ProjectNode(id=7, full_path="top/course/old", name="old", archived=True)
+
+
+def test_archived_project_is_unarchived_for_purge_and_archived_again():
+    repos = FakeRepoManager([repo(1)], lag=0)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+
+    result = make_deleter(projects, FakeClock()).delete_project(ARCHIVED, {7: [repo(1)]})
+
+    assert result.status == "scheduled"
+    assert repos.deleted == [1]
+    assert projects.events == [("unarchive", 7), ("archive", 7), ("delete", 7)]
+
+
+def test_archived_project_is_archived_again_when_purge_fails():
+    repos = FakeRepoManager([repo(1)], delete_error=GitlabDeleteError("400", response_code=400))
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+
+    result = make_deleter(projects, FakeClock()).delete_project(ARCHIVED, {7: [repo(1)]})
+
+    assert result.status == "failed"
+    assert projects.events == [("unarchive", 7), ("archive", 7)]
+
+
+def test_unarchive_failure_skips_purge_and_project():
+    repos = FakeRepoManager([repo(1)], lag=0)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    projects.unarchive_error = GitlabDeleteError("403 Forbidden", response_code=403)
+
+    result = make_deleter(projects, FakeClock()).delete_project(ARCHIVED, {7: [repo(1)]})
+
+    assert result.status == "failed"
+    assert "could not unarchive project" in result.message
+    assert repos.deleted == []
+    assert projects.events == []
+
+
+def test_active_project_is_not_unarchived():
+    repos = FakeRepoManager([repo(1)], lag=0)
+    projects = FakeProjects({7: repos}, after=SCHEDULED)
+    make_deleter(projects, FakeClock()).delete_project(PROJECT, {7: [repo(1)]})
+    assert projects.events == [("delete", 7)]

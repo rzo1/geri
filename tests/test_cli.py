@@ -443,3 +443,12 @@ def test_registry_error_in_summary_suggests_purge():
     assert result.exit_code == cli.EXIT_FAILED
     flat = "".join(result.output.replace("│", "").split())  # table cells wrap
     assert "re-runwith--purge-registry" in flat
+
+
+def test_purge_registry_marks_archived_projects_as_temporarily_unarchived():
+    FakeDiscovery.registries = {10: [RegistryRepository(id=3, path="top/repo", tags_count=1)]}
+    result = runner.invoke(
+        cli.app, ["group", "top", "--no-subgroups", "--purge-registry", "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "unarchived temporarily for the purge" in result.output
